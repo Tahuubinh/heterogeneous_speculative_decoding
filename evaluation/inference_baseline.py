@@ -1,7 +1,7 @@
 """Generate answers with local models.
 
 Usage:
-python3 gen_model_answer.py --model-path lmsys/fastchat-t5-3b-v1.0 --model-id fastchat-t5-3b-v1.0
+python3 evaluation/inference_baseline.py --model-path google/gemma-2-9b-it --model-id gemma-9b --question-file data/spec_bench/split_categories/summarization.jsonl
 """
 import argparse
 from fastchat.utils import str_to_torch_dtype
@@ -38,6 +38,11 @@ if __name__ == "__main__":
         type=str,
         default="mt_bench",
         help="The name of the benchmark question set.",
+    )
+    parser.add_argument(
+        "--question-file", 
+        type=str, 
+        help="The path to the specific question file (e.g., split_categories/summarization.jsonl)."
     )
     parser.add_argument(
         "--question-begin",
@@ -87,14 +92,20 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    question_file = f"data/{args.bench_name}/question.jsonl"
+    if args.question_file:
+        question_file = args.question_file
+    else:
+        question_file = f"data/{args.bench_name}/question.jsonl"
 
     if args.answer_file:
         answer_file = args.answer_file
     else:
-        answer_file = f"data/{args.bench_name}/model_answer/{args.model_id}.jsonl"
+        # If using a specific question_file, it is recommended to set a corresponding output name to avoid overwriting
+        suffix = args.question_file.split('/')[-1].replace('.jsonl', '') if args.question_file else args.bench_name
+        answer_file = f"data/{args.bench_name}/model_answer/{args.model_id}_{suffix}.jsonl"
 
-    print(f"Output to {answer_file}")
+    print(f"Reading from: {question_file}")
+    print(f"Output to: {answer_file}")
 
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
