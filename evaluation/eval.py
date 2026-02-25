@@ -145,8 +145,12 @@ def get_model_answers(
                 if conv.name == "xgen" and output.startswith("Assistant:"):
                     output = output.replace("Assistant:", "", 1).strip()
             except RuntimeError as e:
-                print("ERROR question ID: ", question["question_id"])
+                print("ERROR question ID: ", question["question_id"], "|", e)
                 output = "ERROR"
+                step = 0
+                new_token = 0
+                accept_length_tree = []
+                total_time = 0.0
 
             turns.append(output)
             steps.append(int(step))
@@ -216,8 +220,12 @@ def get_model_answers(
                     if conv.name == "xgen" and output.startswith("Assistant:"):
                         output = output.replace("Assistant:", "", 1).strip()
                 except RuntimeError as e:
-                    print("ERROR question ID: ", question["question_id"])
+                    print("ERROR question ID: ", question["question_id"], "|", e)
                     output = "ERROR"
+                    step = 0
+                    new_token = 0
+                    accept_length_tree = []
+                    total_time = 0.0
 
                 turns.append(output)
                 steps.append(int(step))
