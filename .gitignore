@@ -1,2 +1,3 @@
 data/mt_bench/
+__pycache__/
 old/
