@@ -1,0 +1,7 @@
+2.10.0+cu128
+True
+Reading from: data/spec_bench/question.jsonl
+Output saved to: data/spec_bench/model_answer/Llama-2-13b-hf-sps-openllama3b-float16-temp-0.0_spec_bench.jsonl
+Check model training state: False
+CUDA VISIBLE DEVICES: 0
+Warmup done

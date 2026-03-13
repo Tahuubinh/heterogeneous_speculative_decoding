@@ -1,5 +1,5 @@
-Vicuna_PATH=/your_own_path/vicuna-7b-v1.3
-Eagle_PATH=/your_own_path/EAGLE-Vicuna-7B-v1.3
+Vicuna_PATH=/scratch/mft6zc/models/vicuna-7b-v1.3
+Eagle_PATH=/scratch/mft6zc/models/EAGLE-Vicuna-7B-v1.3
 Eagle3_PATH=/your_own_path/EAGLE3-Vicuna1.3-13B
 Medusa_PATH=/your_own_path/medusa-vicuna-7b-v1.3
 Hydra_PATH=/your_own_path/hydra-vicuna-7b-v1.3

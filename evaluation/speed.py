@@ -75,19 +75,29 @@ def get_single_speedup(jsonl_file, jsonl_file_base, tokenizer_path):
 
 
 def get_mean_speedup():
-    tokenizer_path="/home/xiaheming/data/pretrained_models/Vicuna/vicuna-7b-v1.3/"
-    jsonl_file_name = "vicuna-7b-v1.3-samd.jsonl"
-    jsonl_file_base_name = "vicuna-7b-v1.3-vanilla-float16-temp-0.0.jsonl"
+    #tokenizer_path="/home/xiaheming/data/pretrained_models/Vicuna/vicuna-7b-v1.3/"
+    #jsonl_file_name = "vicuna-7b-v1.3-samd.jsonl"
+    #jsonl_file_base_name = "vicuna-7b-v1.3-vanilla-float16-temp-0.0.jsonl"
+    #jsonl_file_run_list = [
+    #    "./data/spec_bench/model_answer_temp0_run_1/{}".format(jsonl_file_name),
+    #    "./data/spec_bench/model_answer_temp0_run_2/{}".format(jsonl_file_name),
+    #   "./data/spec_bench/model_answer_temp0_run_3/{}".format(jsonl_file_name),
+    #                       ]
+    #jsonl_file_base_run_list = [
+    #    "./data/spec_bench/model_answer_temp0_run_1/{}".format(jsonl_file_base_name),
+    #   "./data/spec_bench/model_answer_temp0_run_2/{}".format(jsonl_file_base_name),
+    #    "./data/spec_bench/model_answer_temp0_run_3/{}".format(jsonl_file_base_name),
+    #                       ]
+
+    tokenizer_path="/sfs/weka/scratch/mft6zc/models/Llama-2-13b-hf"
+    jsonl_file_name = "Llama-2-13b-hf-sps-openllama3b-float16-temp-0.0_spec_bench.jsonl"
+    jsonl_file_base_name = "Llama-2-13b-hf-vanilla-float16-temp-0.0_spec_bench.jsonl"
     jsonl_file_run_list = [
-        "./data/spec_bench/model_answer_temp0_run_1/{}".format(jsonl_file_name),
-        "./data/spec_bench/model_answer_temp0_run_2/{}".format(jsonl_file_name),
-        "./data/spec_bench/model_answer_temp0_run_3/{}".format(jsonl_file_name),
-                           ]
+        "./data/spec_bench/model_answer/{}".format(jsonl_file_name),
+    ]
     jsonl_file_base_run_list = [
-        "./data/spec_bench/model_answer_temp0_run_1/{}".format(jsonl_file_base_name),
-        "./data/spec_bench/model_answer_temp0_run_2/{}".format(jsonl_file_base_name),
-        "./data/spec_bench/model_answer_temp0_run_3/{}".format(jsonl_file_base_name),
-                           ]
+        "./data/spec_bench/model_answer/{}".format(jsonl_file_base_name),
+    ]   
 
     for subtask_name in ["mt_bench", "translation", "summarization", "qa", "math_reasoning", "rag", "overall"]:
         print("=" * 30, "Task: ", subtask_name, "=" * 30)
@@ -125,26 +135,30 @@ if __name__ == "__main__":
 
     parser.add_argument(
         "--file-path",
-        default='./data/spec_bench/model_answer/vicuna-7b-v1.3-samd.jsonl',
+        #default='./data/spec_bench/model_answer/vicuna-7b-v1.3-samd.jsonl',
+        default='./data/spec_bench/model_answer/Llama-2-13b-hf-sps-openllama3b-float16-temp-0.0_spec_bench.jsonl',
         type=str,
         help="The file path of evaluated Speculative Decoding methods.",
     )
     parser.add_argument(
         "--base-path",
-        default='./data/spec_bench/model_answer/vicuna-7b-v1.3-vanilla-float16-temp-0.0.jsonl',
+        #default='./data/spec_bench/model_answer/vicuna-7b-v1.3-vanilla-float16-temp-0.0.jsonl',
+        default='./data/spec_bench/model_answer/Llama-2-13b-hf-vanilla-float16-temp-0.0_spec_bench.jsonl',
         type=str,
         help="The file path of evaluated baseline.",
     )
     parser.add_argument(
         "--tokenizer-path",
-        default='/home/xiaheming/data/pretrained_models/Vicuna/vicuna-7b-v1.3',
+        #default='/home/xiaheming/data/pretrained_models/Vicuna/vicuna-7b-v1.3',
+        default='/sfs/weka/scratch/mft6zc/models/Llama-2-13b-hf',
         type=str,
         help="The file path of evaluated baseline.",
     )
     parser.add_argument(
         "--mean-report",
         action="store_true",
-        default=True,
+        #default=True,
+        default=False,
         help="report mean speedup over different runs")
 
     args = parser.parse_args()
