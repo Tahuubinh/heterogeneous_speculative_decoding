@@ -2,3 +2,4 @@ data/mt_bench/
 __pycache__/
 old/
 data/model_answer/
+models/
