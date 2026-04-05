@@ -1,6 +1,12 @@
 import argparse
 import torch
 from evaluation.eval import run_eval, reorg_answer_file
+from evaluation.result_utils import (
+    build_result_bundle,
+    summarize_answer_file,
+    write_metrics,
+    write_run_config,
+)
 from fastchat.utils import str_to_torch_dtype
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationMixin
 from model.sps.decoding import assisted_decoding
@@ -77,14 +83,29 @@ if __name__ == "__main__":
     else:
         question_file = f"data/{args.bench_name}/question.jsonl"
 
-    if args.answer_file:
-        answer_file = args.answer_file
-    else:
-        suffix = args.question_file.split('/')[-1].replace('.jsonl', '') if args.question_file else args.bench_name
-        answer_file = f"data/{args.bench_name}/model_answer/{args.model_id}_{suffix}.jsonl"
+    result_bundle = build_result_bundle(
+        model_path=args.model_path,
+        drafter_path=args.drafter_path,
+        draft_tokens=args.draft_tokens,
+        question_file=question_file,
+        bench_name=args.bench_name,
+        version=args.model_id,
+        answer_file_override=args.answer_file,
+    )
+    answer_file = result_bundle["answer_file"]
 
     print(f"Reading from: {question_file}")
     print(f"Output saved to: {answer_file}")
+    print(f"Result directory: {result_bundle['result_dir']}")
+
+    write_run_config(
+        result_bundle["config_file"],
+        vars(args),
+        extra={
+            "question_file": question_file,
+            "result_dir": result_bundle["result_dir"],
+        },
+    )
 
     # Load the Target Model
     model = AutoModelForCausalLM.from_pretrained(
@@ -153,3 +174,15 @@ if __name__ == "__main__":
     )
 
     reorg_answer_file(answer_file)
+
+    metrics = summarize_answer_file(answer_file, draft_tokens=args.draft_tokens)
+    write_metrics(
+        result_bundle["metrics_file"],
+        metrics,
+        extra={
+            "question_file": question_file,
+            "answer_file": answer_file,
+            "result_dir": result_bundle["result_dir"],
+        },
+    )
+    print(f"Metrics saved to: {result_bundle['metrics_file']}")
