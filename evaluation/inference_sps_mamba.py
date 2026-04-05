@@ -16,6 +16,11 @@ try:
 except Exception:  # pragma: no cover
     InferenceParams = None
 
+try:
+    from mamba_ssm.utils.generation import update_graph_cache as mamba_update_graph_cache
+except Exception:  # pragma: no cover
+    mamba_update_graph_cache = None
+
 
 def parse_optional_int(value):
     if value is None:
@@ -54,6 +59,13 @@ def _mamba_forward(drafter, input_ids, inference_params=None):
     return drafter(input_ids=input_ids, inference_params=inference_params)
 
 
+def _last_token_logits(outputs):
+    logits = _get_logits_from_output(outputs)
+    if logits.ndim == 3:
+        return logits[:, -1, :]
+    return logits
+
+
 def _clone_mamba_inference_params(inference_params, backup_mode="tensor_clone"):
     if inference_params is None:
         return None
@@ -89,7 +101,14 @@ def _clone_mamba_inference_params(inference_params, backup_mode="tensor_clone"):
     )
 
 
-def _build_mamba_state_from_prefix(drafter, prefix_ids, max_new_tokens, state_seqlen_buffer):
+def _build_mamba_state_from_prefix(
+    drafter,
+    prefix_ids,
+    max_new_tokens,
+    state_seqlen_buffer,
+    use_mamba_cuda_graphs=False,
+    mamba_cg_warmups=2,
+):
     if InferenceParams is None:
         raise RuntimeError(
             "InferenceParams is unavailable. Install a mamba_ssm version exposing mamba_ssm.utils.generation.InferenceParams"
@@ -97,20 +116,82 @@ def _build_mamba_state_from_prefix(drafter, prefix_ids, max_new_tokens, state_se
 
     batch_size = int(prefix_ids.shape[0])
     max_seqlen = int(prefix_ids.shape[1] + max_new_tokens + state_seqlen_buffer)
+
+    if use_mamba_cuda_graphs:
+        if mamba_update_graph_cache is None:
+            raise RuntimeError(
+                "CUDA Graphs requested but update_graph_cache is unavailable in current mamba_ssm version"
+            )
+
+        cg_cache = getattr(drafter, "_spec_cg_cache", None)
+        param = next(drafter.parameters())
+        cg_cache = mamba_update_graph_cache(
+            drafter,
+            cg_cache,
+            batch_size=batch_size,
+            seqlen_og=int(prefix_ids.shape[1]),
+            max_seqlen=max_seqlen,
+            decoding_seqlens=(1,),
+            dtype=param.dtype,
+            n_warmups=max(0, int(mamba_cg_warmups)),
+        )
+        setattr(drafter, "_spec_cg_cache", cg_cache)
+        inference_params = cg_cache.inference_params
+        outputs = drafter(input_ids=prefix_ids, inference_params=inference_params, num_last_tokens=1)
+        next_logits = _last_token_logits(outputs)
+        inference_params.seqlen_offset += int(prefix_ids.shape[1])
+        if inference_params.lengths_per_sample is not None:
+            inference_params.lengths_per_sample[:] = inference_params.seqlen_offset
+        return {
+            "inference_params": inference_params,
+            "next_logits": next_logits,
+            "cg_cache": cg_cache,
+        }
+
     inference_params = InferenceParams(max_seqlen=max_seqlen, max_batch_size=batch_size)
     outputs = _mamba_forward(drafter, prefix_ids, inference_params=inference_params)
-    next_logits = _get_logits_from_output(outputs)[:, -1, :]
+    next_logits = _last_token_logits(outputs)
     return {
         "inference_params": inference_params,
         "next_logits": next_logits,
+        "cg_cache": None,
     }
+
+
+def _mamba_step_with_state(drafter, state, token_ids):
+    if state.get("cg_cache") is not None:
+        batch_size = int(token_ids.shape[0])
+        seqlen_offset = int(state["inference_params"].seqlen_offset)
+        position_ids = torch.full(
+            (batch_size, token_ids.shape[1]),
+            seqlen_offset,
+            dtype=torch.long,
+            device=token_ids.device,
+        )
+        logits = state["cg_cache"].run(token_ids, position_ids, seqlen_offset)
+        if logits.ndim == 3:
+            logits = logits[:, -1, :]
+        state["inference_params"].seqlen_offset += int(token_ids.shape[1])
+        if state["inference_params"].lengths_per_sample is not None:
+            state["inference_params"].lengths_per_sample[:] = state["inference_params"].seqlen_offset
+        state["next_logits"] = logits
+        return state
+
+    outputs = _mamba_forward(drafter, token_ids, inference_params=state["inference_params"])
+    state["next_logits"] = _last_token_logits(outputs)
+    return state
 
 
 def _consume_tokens_with_state(drafter, state, tokens):
     if tokens.shape[1] == 0:
         return state
-    outputs = _mamba_forward(drafter, tokens, inference_params=state["inference_params"])
-    state["next_logits"] = _get_logits_from_output(outputs)[:, -1, :]
+
+    if state.get("cg_cache") is not None and tokens.shape[1] > 1:
+        for i in range(tokens.shape[1]):
+            state = _mamba_step_with_state(drafter, state, tokens[:, i:i + 1])
+        return state
+
+    state = _mamba_step_with_state(drafter, state, tokens)
     return state
 
 
@@ -130,8 +211,8 @@ def _draft_with_mamba_state(
     for _ in range(draft_steps):
         next_token = _sample_or_greedy(cur_logits, do_sample=do_sample, temperature=temperature)
         drafted_tokens.append(next_token)
-        outputs = _mamba_forward(drafter, next_token, inference_params=state["inference_params"])
-        cur_logits = _get_logits_from_output(outputs)[:, -1, :]
+        state = _mamba_step_with_state(drafter, state, next_token)
+        cur_logits = state["next_logits"]
 
     state["next_logits"] = cur_logits
     return torch.cat(drafted_tokens, dim=-1)
@@ -202,6 +283,8 @@ def sps_forward(
     mamba_state_seqlen_buffer=32,
     mamba_state_backup_mode="tensor_clone",
     use_target_kv_cache=True,
+    use_mamba_cuda_graphs=False,
+    mamba_cg_warmups=2,
 ):
     """
     Forward pass for Speculative Parallel Sampling (SPS).
@@ -221,6 +304,7 @@ def sps_forward(
 
     adaptive = draft_tokens is None
     current_draft_tokens = 5 if adaptive else int(draft_tokens)
+    mamba_cg_enabled = bool(use_mamba_cuda_graphs and mamba_state_strategy != "stateful_restore")
 
     while new_token < max_new_tokens:
         steps += 1
@@ -236,6 +320,8 @@ def sps_forward(
                 output_ids.to(next(drafter.parameters()).device),
                 max_new_tokens,
                 mamba_state_seqlen_buffer,
+                use_mamba_cuda_graphs=mamba_cg_enabled,
+                mamba_cg_warmups=mamba_cg_warmups,
             )
             draft_ids = _draft_with_mamba_state(
                 drafter,
@@ -252,6 +338,8 @@ def sps_forward(
                     output_ids.to(next(drafter.parameters()).device),
                     max_new_tokens,
                     mamba_state_seqlen_buffer,
+                    use_mamba_cuda_graphs=mamba_cg_enabled,
+                    mamba_cg_warmups=mamba_cg_warmups,
                 )
 
             pre_draft_state_backup = None
@@ -311,6 +399,8 @@ def sps_forward(
                         output_ids.to(next(drafter.parameters()).device),
                         max_new_tokens,
                         mamba_state_seqlen_buffer,
+                        use_mamba_cuda_graphs=mamba_cg_enabled,
+                        mamba_cg_warmups=mamba_cg_warmups,
                     )
                 elif mamba_state_strategy == "stateful_restore" and pre_draft_state_backup is not None:
                     mamba_state["inference_params"] = pre_draft_state_backup["inference_params"]
@@ -322,6 +412,8 @@ def sps_forward(
                         output_ids.to(next(drafter.parameters()).device),
                         max_new_tokens,
                         mamba_state_seqlen_buffer,
+                        use_mamba_cuda_graphs=mamba_cg_enabled,
+                        mamba_cg_warmups=mamba_cg_warmups,
                     )
                 else:
                     raise RuntimeError(
@@ -407,6 +499,17 @@ if __name__ == "__main__":
         action="store_true",
         help="Disable target-model KV cache in verification (debug only; much slower).",
     )
+    parser.add_argument(
+        "--mamba-use-cuda-graphs",
+        action="store_true",
+        help="Enable CUDA Graphs for Mamba draft decode path (experimental, can improve draft throughput).",
+    )
+    parser.add_argument(
+        "--mamba-cg-warmups",
+        type=int,
+        default=2,
+        help="Number of warmup iterations used when capturing Mamba CUDA Graphs.",
+    )
     
     args = parser.parse_args()
 
@@ -477,13 +580,20 @@ if __name__ == "__main__":
         "backup_mode="
         f"{args.mamba_state_backup_mode}, "
         "target_kv_cache="
-        f"{not args.disable_target_kv_cache}"
+        f"{not args.disable_target_kv_cache}, "
+        "mamba_cuda_graphs="
+        f"{args.mamba_use_cuda_graphs}, "
+        "mamba_cg_warmups="
+        f"{args.mamba_cg_warmups}"
     )
 
     model.eval()
     drafter.eval()
 
     do_sample = True if args.temperature > 0 else False
+
+    if args.mamba_use_cuda_graphs and args.mamba_state_strategy == "stateful_restore":
+        print("Warning: disabling Mamba CUDA Graphs for stateful_restore to keep state snapshot/restore semantics stable.")
 
     run_eval(
         model=model,
@@ -505,6 +615,8 @@ if __name__ == "__main__":
         mamba_state_seqlen_buffer=args.mamba_state_seqlen_buffer,
         mamba_state_backup_mode=args.mamba_state_backup_mode,
         use_target_kv_cache=not args.disable_target_kv_cache,
+        use_mamba_cuda_graphs=args.mamba_use_cuda_graphs,
+        mamba_cg_warmups=args.mamba_cg_warmups,
         temperature=args.temperature,
         do_sample=do_sample,
     )
