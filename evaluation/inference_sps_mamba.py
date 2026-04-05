@@ -1,13 +1,20 @@
 import argparse
+import copy
 import torch
 from evaluation.eval import run_eval, reorg_answer_file
 from fastchat.utils import str_to_torch_dtype
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.generation.candidate_generator import _crop_past_key_values
 
 try:
     from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 except Exception:  # pragma: no cover
     MambaLMHeadModel = None
+
+try:
+    from mamba_ssm.utils.generation import InferenceParams
+except Exception:  # pragma: no cover
+    InferenceParams = None
 
 
 def parse_optional_int(value):
@@ -41,40 +48,127 @@ def _get_logits_from_output(outputs):
     raise RuntimeError("Unexpected model output format: cannot find logits")
 
 
-def _draft_with_mamba(prefix_ids, drafter, draft_steps, do_sample=False, temperature=0.0):
-    """Generate draft tokens by repeatedly querying Mamba on the running prefix.
+def _mamba_forward(drafter, input_ids, inference_params=None):
+    if inference_params is None:
+        return drafter(input_ids=input_ids)
+    return drafter(input_ids=input_ids, inference_params=inference_params)
 
-    This avoids custom state rollback logic by recomputing from the accepted prefix each SPS step.
-    """
+
+def _clone_mamba_inference_params(inference_params, backup_mode="tensor_clone"):
+    if inference_params is None:
+        return None
+    if backup_mode == "deepcopy":
+        return copy.deepcopy(inference_params)
+
+    if InferenceParams is None:
+        raise RuntimeError("InferenceParams is required for tensor_clone backup mode")
+
+    key_value_memory_dict = {}
+    for layer_idx, state_value in inference_params.key_value_memory_dict.items():
+        if isinstance(state_value, tuple):
+            key_value_memory_dict[layer_idx] = tuple(
+                tensor.clone() if torch.is_tensor(tensor) else copy.deepcopy(tensor)
+                for tensor in state_value
+            )
+        elif torch.is_tensor(state_value):
+            key_value_memory_dict[layer_idx] = state_value.clone()
+        else:
+            key_value_memory_dict[layer_idx] = copy.deepcopy(state_value)
+
+    lengths_per_sample = None
+    if inference_params.lengths_per_sample is not None:
+        lengths_per_sample = inference_params.lengths_per_sample.clone()
+
+    return InferenceParams(
+        max_seqlen=inference_params.max_seqlen,
+        max_batch_size=inference_params.max_batch_size,
+        seqlen_offset=inference_params.seqlen_offset,
+        batch_size_offset=inference_params.batch_size_offset,
+        key_value_memory_dict=key_value_memory_dict,
+        lengths_per_sample=lengths_per_sample,
+    )
+
+
+def _build_mamba_state_from_prefix(drafter, prefix_ids, max_new_tokens, state_seqlen_buffer):
+    if InferenceParams is None:
+        raise RuntimeError(
+            "InferenceParams is unavailable. Install a mamba_ssm version exposing mamba_ssm.utils.generation.InferenceParams"
+        )
+
+    batch_size = int(prefix_ids.shape[0])
+    max_seqlen = int(prefix_ids.shape[1] + max_new_tokens + state_seqlen_buffer)
+    inference_params = InferenceParams(max_seqlen=max_seqlen, max_batch_size=batch_size)
+    outputs = _mamba_forward(drafter, prefix_ids, inference_params=inference_params)
+    next_logits = _get_logits_from_output(outputs)[:, -1, :]
+    return {
+        "inference_params": inference_params,
+        "next_logits": next_logits,
+    }
+
+
+def _consume_tokens_with_state(drafter, state, tokens):
+    if tokens.shape[1] == 0:
+        return state
+    outputs = _mamba_forward(drafter, tokens, inference_params=state["inference_params"])
+    state["next_logits"] = _get_logits_from_output(outputs)[:, -1, :]
+    return state
+
+
+def _draft_with_mamba_state(
+    drafter,
+    state,
+    draft_steps,
+    do_sample=False,
+    temperature=0.0,
+):
     if draft_steps <= 0:
-        return prefix_ids[:, :0]
+        batch_size = int(state["next_logits"].shape[0])
+        return torch.empty((batch_size, 0), dtype=torch.long, device=state["next_logits"].device)
 
-    device = next(drafter.parameters()).device
-    draft_seq = prefix_ids.to(device)
     drafted_tokens = []
-
+    cur_logits = state["next_logits"]
     for _ in range(draft_steps):
-        outputs = drafter(input_ids=draft_seq)
-        logits = _get_logits_from_output(outputs)[:, -1, :]
-        next_token = _sample_or_greedy(logits, do_sample=do_sample, temperature=temperature)
+        next_token = _sample_or_greedy(cur_logits, do_sample=do_sample, temperature=temperature)
         drafted_tokens.append(next_token)
-        draft_seq = torch.cat((draft_seq, next_token), dim=-1)
+        outputs = _mamba_forward(drafter, next_token, inference_params=state["inference_params"])
+        cur_logits = _get_logits_from_output(outputs)[:, -1, :]
 
+    state["next_logits"] = cur_logits
     return torch.cat(drafted_tokens, dim=-1)
 
 
-def _target_verify(prefix_ids, draft_tokens, model, do_sample=False, temperature=0.0):
+def _target_verify(
+    prefix_ids,
+    draft_tokens,
+    model,
+    past_key_values=None,
+    use_target_kv_cache=True,
+    do_sample=False,
+    temperature=0.0,
+):
     """Run one target forward pass over prefix+draft and return selected tokens + matches."""
     cur_len = prefix_ids.shape[1]
     candidate_len = draft_tokens.shape[1]
 
-    candidate_input = torch.cat((prefix_ids, draft_tokens.to(prefix_ids.device)), dim=-1)
-    attention_mask = torch.ones_like(candidate_input, device=candidate_input.device)
-    outputs = model(input_ids=candidate_input, attention_mask=attention_mask)
-    logits = _get_logits_from_output(outputs)
+    if use_target_kv_cache and past_key_values is not None:
+        candidate_input = torch.cat((prefix_ids[:, -1:], draft_tokens.to(prefix_ids.device)), dim=-1)
+        outputs = model(
+            input_ids=candidate_input,
+            past_key_values=past_key_values,
+            use_cache=True,
+        )
+        relevant_logits = _get_logits_from_output(outputs)
+    else:
+        candidate_input = torch.cat((prefix_ids, draft_tokens.to(prefix_ids.device)), dim=-1)
+        outputs = model(
+            input_ids=candidate_input,
+            use_cache=use_target_kv_cache,
+        )
+        logits = _get_logits_from_output(outputs)
+        # candidate_len + 1 target predictions, aligned with HF assisted generation logic.
+        relevant_logits = logits[:, cur_len - 1: cur_len + candidate_len, :]
 
-    # candidate_len + 1 target predictions, aligned with HF assisted generation logic.
-    relevant_logits = logits[:, cur_len - 1: cur_len + candidate_len, :]
+    new_past_key_values = outputs.past_key_values if use_target_kv_cache else None
     selected = []
     for i in range(relevant_logits.shape[1]):
         next_tok = _sample_or_greedy(
@@ -86,13 +180,13 @@ def _target_verify(prefix_ids, draft_tokens, model, do_sample=False, temperature
     selected_tokens = torch.cat(selected, dim=-1)
 
     if candidate_len == 0:
-        return selected_tokens[:, :1], 0
+        return selected_tokens[:, :1], 0, new_past_key_values
 
     candidate_new_tokens = draft_tokens.to(selected_tokens.device)
     mismatch_prefix = ((~(candidate_new_tokens == selected_tokens[:, :-1])).cumsum(dim=-1) < 1)
     n_matches = int(mismatch_prefix.sum().item())
     valid_tokens = selected_tokens[:, : n_matches + 1]
-    return valid_tokens, n_matches
+    return valid_tokens, n_matches, new_past_key_values
 
 def sps_forward(
     inputs,
@@ -103,6 +197,11 @@ def sps_forward(
     temperature=0.0,
     drafter=None,
     draft_tokens=None,
+    mamba_state_strategy="recompute",
+    mamba_state_fallback_reset_replay=True,
+    mamba_state_seqlen_buffer=32,
+    mamba_state_backup_mode="tensor_clone",
+    use_target_kv_cache=True,
 ):
     """
     Forward pass for Speculative Parallel Sampling (SPS).
@@ -117,6 +216,8 @@ def sps_forward(
     new_token = 0
     accept_length_list = []
     output_ids = prefix_ids
+    mamba_state = None
+    target_past_key_values = None
 
     adaptive = draft_tokens is None
     current_draft_tokens = 5 if adaptive else int(draft_tokens)
@@ -127,26 +228,105 @@ def sps_forward(
         max_matches = max(remaining - 1, 0)
         effective_draft_steps = min(current_draft_tokens, max_matches)
 
-        draft_ids = _draft_with_mamba(
+        if mamba_state_strategy == "recompute":
+            # Recompute strategy: rebuild Mamba state from accepted prefix once per SPS step,
+            # then draft incrementally from cached state.
+            temp_mamba_state = _build_mamba_state_from_prefix(
+                drafter,
+                output_ids.to(next(drafter.parameters()).device),
+                max_new_tokens,
+                mamba_state_seqlen_buffer,
+            )
+            draft_ids = _draft_with_mamba_state(
+                drafter,
+                temp_mamba_state,
+                effective_draft_steps,
+                do_sample=do_sample,
+                temperature=temperature,
+            )
+            pre_draft_state_backup = None
+        else:
+            if mamba_state is None:
+                mamba_state = _build_mamba_state_from_prefix(
+                    drafter,
+                    output_ids.to(next(drafter.parameters()).device),
+                    max_new_tokens,
+                    mamba_state_seqlen_buffer,
+                )
+
+            pre_draft_state_backup = None
+            if mamba_state_strategy == "stateful_restore":
+                try:
+                    pre_draft_state_backup = {
+                        "inference_params": _clone_mamba_inference_params(
+                            mamba_state["inference_params"],
+                            backup_mode=mamba_state_backup_mode,
+                        ),
+                        "next_logits": mamba_state["next_logits"].clone(),
+                    }
+                except Exception:
+                    if not mamba_state_fallback_reset_replay:
+                        raise
+                    pre_draft_state_backup = None
+
+            draft_ids = _draft_with_mamba_state(
+                drafter,
+                mamba_state,
+                effective_draft_steps,
+                do_sample=do_sample,
+                temperature=temperature,
+            )
+
+        valid_tokens, n_matches, target_past_key_values = _target_verify(
             output_ids,
-            drafter,
-            effective_draft_steps,
+            draft_ids,
+            model,
+            past_key_values=target_past_key_values,
+            use_target_kv_cache=use_target_kv_cache,
             do_sample=do_sample,
             temperature=temperature,
         )
 
-        valid_tokens, n_matches = _target_verify(
-            output_ids,
-            draft_ids,
-            model,
-            do_sample=do_sample,
-            temperature=temperature,
-        )
+        if use_target_kv_cache and target_past_key_values is not None:
+            keep_cache_length = int(output_ids.shape[1] + n_matches)
+            target_past_key_values = _crop_past_key_values(model, target_past_key_values, keep_cache_length)
 
         output_ids = torch.cat((output_ids, valid_tokens.to(output_ids.device)), dim=-1)
         accepted = int(valid_tokens.shape[1])
         new_token += accepted
         accept_length_list.append(accepted)
+
+        if mamba_state_strategy in {"reset_replay", "stateful_restore"}:
+            drafted_count = int(draft_ids.shape[1]) if draft_ids is not None else 0
+            full_accept = n_matches == drafted_count
+            valid_tokens_on_drafter = valid_tokens.to(next(drafter.parameters()).device)
+
+            if full_accept:
+                extra_target_token = valid_tokens_on_drafter[:, -1:]
+                mamba_state = _consume_tokens_with_state(drafter, mamba_state, extra_target_token)
+            else:
+                if mamba_state_strategy == "reset_replay":
+                    mamba_state = _build_mamba_state_from_prefix(
+                        drafter,
+                        output_ids.to(next(drafter.parameters()).device),
+                        max_new_tokens,
+                        mamba_state_seqlen_buffer,
+                    )
+                elif mamba_state_strategy == "stateful_restore" and pre_draft_state_backup is not None:
+                    mamba_state["inference_params"] = pre_draft_state_backup["inference_params"]
+                    mamba_state["next_logits"] = pre_draft_state_backup["next_logits"]
+                    mamba_state = _consume_tokens_with_state(drafter, mamba_state, valid_tokens_on_drafter)
+                elif mamba_state_fallback_reset_replay:
+                    mamba_state = _build_mamba_state_from_prefix(
+                        drafter,
+                        output_ids.to(next(drafter.parameters()).device),
+                        max_new_tokens,
+                        mamba_state_seqlen_buffer,
+                    )
+                else:
+                    raise RuntimeError(
+                        "State rollback required but unavailable. Enable --mamba-state-fallback-reset-replay."
+                    )
 
         if adaptive:
             if n_matches == current_draft_tokens:
@@ -189,6 +369,43 @@ if __name__ == "__main__":
             "Draft tokens per speculative step. Set to None (default) for adaptive heuristic "
             "behavior like inference_sps_old.py, or set a positive integer for fixed constant drafting."
         ),
+    )
+    parser.add_argument(
+        "--mamba-state-strategy",
+        type=str,
+        default="recompute",
+        choices=["recompute", "reset_replay", "stateful_restore"],
+        help=(
+            "Mamba draft-state handling strategy: recompute (safe baseline), "
+            "reset_replay (reset and replay accepted prefix on reject), "
+            "stateful_restore (try backup/restore state, fallback optional)."
+        ),
+    )
+    parser.add_argument(
+        "--mamba-state-fallback-reset-replay",
+        action="store_true",
+        help="Only for stateful_restore: if deepcopy/restore fails, fallback to reset+replay.",
+    )
+    parser.add_argument(
+        "--mamba-state-seqlen-buffer",
+        type=int,
+        default=32,
+        help="Extra headroom for Mamba InferenceParams.max_seqlen in stateful modes.",
+    )
+    parser.add_argument(
+        "--mamba-state-backup-mode",
+        type=str,
+        default="tensor_clone",
+        choices=["tensor_clone", "deepcopy"],
+        help=(
+            "Backup method for stateful_restore. tensor_clone is usually faster than deepcopy. "
+            "deepcopy is slower but can be used for debugging correctness."
+        ),
+    )
+    parser.add_argument(
+        "--disable-target-kv-cache",
+        action="store_true",
+        help="Disable target-model KV cache in verification (debug only; much slower).",
     )
     
     args = parser.parse_args()
@@ -250,6 +467,18 @@ if __name__ == "__main__":
         print("Draft config -> adaptive heuristic, initial draft_tokens=5")
     else:
         print(f"Draft config -> fixed draft_tokens={args.draft_tokens}")
+    print(
+        "Mamba state config -> strategy="
+        f"{args.mamba_state_strategy}, "
+        "fallback_reset_replay="
+        f"{args.mamba_state_fallback_reset_replay}, "
+        "seqlen_buffer="
+        f"{args.mamba_state_seqlen_buffer}, "
+        "backup_mode="
+        f"{args.mamba_state_backup_mode}, "
+        "target_kv_cache="
+        f"{not args.disable_target_kv_cache}"
+    )
 
     model.eval()
     drafter.eval()
@@ -271,6 +500,11 @@ if __name__ == "__main__":
         num_gpus_total=args.num_gpus_total,
         drafter=drafter,
         draft_tokens=args.draft_tokens,
+        mamba_state_strategy=args.mamba_state_strategy,
+        mamba_state_fallback_reset_replay=args.mamba_state_fallback_reset_replay,
+        mamba_state_seqlen_buffer=args.mamba_state_seqlen_buffer,
+        mamba_state_backup_mode=args.mamba_state_backup_mode,
+        use_target_kv_cache=not args.disable_target_kv_cache,
         temperature=args.temperature,
         do_sample=do_sample,
     )
