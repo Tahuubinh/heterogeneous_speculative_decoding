@@ -4,3 +4,4 @@ old/
 data/model_answer/
 srun/
 results/
+slurm/

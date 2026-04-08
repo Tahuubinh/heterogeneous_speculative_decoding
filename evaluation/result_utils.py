@@ -116,11 +116,26 @@ def summarize_answer_file(answer_file: str, draft_tokens: Optional[int]) -> Dict
         float(sum(accept_lengths)) / len(accept_lengths) if len(accept_lengths) > 0 else None
     )
 
+    accepted_draft_tokens = None
+    accepted_draft_throughput = None
+    proposed_draft_tokens_estimated = None
+    proposed_draft_throughput_estimated = None
+
     acceptance_rate = None
+    if len(accept_lengths) > 0:
+        accepted_draft_tokens = int(sum(max(int(x) - 1, 0) for x in accept_lengths))
+        accepted_draft_throughput = (
+            accepted_draft_tokens / total_wall_time if total_wall_time > 0 else None
+        )
+
     if draft_tokens is not None and draft_tokens > 0 and len(accept_lengths) > 0:
-        accepted_draft_tokens = sum(max(int(x) - 1, 0) for x in accept_lengths)
-        proposed_draft_tokens = int(draft_tokens) * len(accept_lengths)
-        acceptance_rate = accepted_draft_tokens / proposed_draft_tokens if proposed_draft_tokens > 0 else None
+        proposed_draft_tokens_estimated = int(draft_tokens) * len(accept_lengths)
+        proposed_draft_throughput_estimated = (
+            proposed_draft_tokens_estimated / total_wall_time if total_wall_time > 0 else None
+        )
+        acceptance_rate = (
+            accepted_draft_tokens / proposed_draft_tokens_estimated if proposed_draft_tokens_estimated > 0 else None
+        )
 
     return {
         "total_questions": total_questions,
@@ -132,11 +147,19 @@ def summarize_answer_file(answer_file: str, draft_tokens: Optional[int]) -> Dict
         "throughput_tokens_per_sec": throughput,
         "avg_time_per_token_sec": avg_time_per_token,
         "avg_accept_tokens_per_step": avg_accept_tokens_per_step,
+        "accepted_draft_tokens_total": accepted_draft_tokens,
+        "accepted_draft_tokens_per_sec": accepted_draft_throughput,
+        "proposed_draft_tokens_total_estimated": proposed_draft_tokens_estimated,
+        "proposed_draft_tokens_per_sec_estimated": proposed_draft_throughput_estimated,
         "acceptance_rate": acceptance_rate,
         "acceptance_rate_note": (
             "Estimated as accepted_draft_tokens/proposed_draft_tokens and only available for fixed draft_tokens."
             if draft_tokens is not None
             else "Not computed for adaptive draft_tokens because proposed draft count varies by step."
+        ),
+        "draft_throughput_note": (
+            "accepted_draft_tokens_per_sec is exact from accept_lengths; "
+            "proposed_draft_tokens_per_sec_estimated is only available for fixed draft_tokens."
         ),
     }
 
