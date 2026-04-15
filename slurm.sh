@@ -4,11 +4,11 @@
 #SBATCH --gres=gpu:a40:1
 #SBATCH --time=1-00:00:00
 #SBATCH --partition=gpu
-#SBATCH --job-name=analysisreg
-#SBATCH --mem=64GB
+#SBATCH --job-name=draft
+#SBATCH --mem=20GB
 #SBATCH --output=./slurm/slurm%j.out
 #SBATCH --error=./slurm/slurm%j.err
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=4
 
 set -e
 
@@ -30,11 +30,21 @@ SCRIPT_USER="${SUDO_USER:-$USER}"
 VENV_PATH="/bigtemp/${SCRIPT_USER}/nlp_venv"
 source "$VENV_PATH/bin/activate"
 
+HF_CACHE_ROOT="/bigtemp/${SCRIPT_USER}/hf_cache"
+export HF_HOME="$HF_CACHE_ROOT"
+export HF_HUB_CACHE="$HF_CACHE_ROOT/hub"
+export TRANSFORMERS_CACHE="$HF_CACHE_ROOT/transformers"
+mkdir -p "$HF_HUB_CACHE" "$TRANSFORMERS_CACHE"
+
 python -m evaluation.inference_sps \
-    --model-path EleutherAI/pythia-6.9b \
+    --model-path OpenAssistant/oasst-sft-4-pythia-12b-epoch-3.5 \
     --drafter-path EleutherAI/pythia-160m \
-    --model-id pythia-6.9b-sps-pythia-160m \
-    --question-file data/spec_bench/split_categories/summarization.jsonl \
+    --model-id test_sps_open_eleuther \
+    --question-file data/spec_bench/split_categories/rag.jsonl \
     --bench-name spec_bench \
     --temperature 0.0 \
-    --dtype float16
+    --dtype float16 \
+    --draft-tokens 5 \
+    --max-new-tokens 512
+
+# CUDA_VISIBLE_DEVICES=${GPU_DEVICES} python -m evaluation.inference_sps --model-path $Vicuna_PATH --drafter-path $Drafter_PATH --model-id ${MODEL_NAME}-sps-68m-${torch_dtype}-temp-${TEMP} --bench-name $bench_NAME --temperature $TEMP --dtype $torch_dtype
