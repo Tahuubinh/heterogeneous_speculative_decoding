@@ -6,8 +6,8 @@
 #SBATCH --partition=gpu
 #SBATCH --job-name=draft
 #SBATCH --mem=30GB
-#SBATCH --output=./slurm/slurm%j.out
-#SBATCH --error=./slurm/slurm%j.err
+#SBATCH --output=./slurm/slurm_ngram%j.out
+#SBATCH --error=./slurm/slurm_ngram%j.err
 #SBATCH --cpus-per-task=4
 
 set -e
@@ -41,10 +41,13 @@ TARGET_MODEL_PATH="${TARGET_MODEL_PATH:-OpenAssistant/oasst-sft-4-pythia-12b-epo
 NGRAM_MODEL_TEMPLATE="${NGRAM_MODEL_TEMPLATE:-artifacts/ngram/oasst_sft4_pythia12b_{order}gram_ultrachat.pkl.gz}"
 MODEL_ID_PREFIX="${MODEL_ID_PREFIX:-${MODEL_ID:-test_ngram_open_ultrachat}}"
 NGRAM_ORDERS="${NGRAM_ORDERS:-1 2 3 4}"
-QUESTION_FILE="${QUESTION_FILE:-data/spec_bench/split_categories/rag.jsonl}"
+# Directory containing per-category question files (jsonl). Will iterate all *.jsonl inside.
+QUESTION_DIR="${QUESTION_DIR:-data/spec_bench/split_categories}"
+# Bench name base (used when question-file is not provided by the script).
 BENCH_NAME="${BENCH_NAME:-spec_bench}"
-DTYPE="${DTYPE:-float16}"
-DRAFT_NUM_CANDIDATE_TOKENS="${DRAFT_NUM_CANDIDATE_TOKENS:-5}"
+D_TYPE="${D_TYPE:-float16}"
+# Draft candidates to iterate (space-separated list)
+DRAFT_CANDIDATES="${DRAFT_CANDIDATES:-3 5 7}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-512}"
 
 resolve_ngram_model_path() {
@@ -80,32 +83,54 @@ resolve_ngram_model_path() {
     return 1
 }
 
-for ORDER in $NGRAM_ORDERS; do
-    if ! [[ "$ORDER" =~ ^[0-9]+$ ]] || [[ "$ORDER" -lt 1 ]]; then
-        echo "Invalid n-gram order in NGRAM_ORDERS: $ORDER"
-        echo "Expected a space-separated list of positive integers, e.g. '1 2 3 4'."
+if [[ ! -d "$QUESTION_DIR" ]]; then
+    echo "Question directory not found: $QUESTION_DIR"
+    exit 1
+fi
+
+for QUESTION_FILE in "$QUESTION_DIR"/*.jsonl; do
+    if [[ ! -f "$QUESTION_FILE" ]]; then
+        echo "No question files found in $QUESTION_DIR"
         exit 1
     fi
 
-    CURRENT_NGRAM_MODEL_PATH="$(resolve_ngram_model_path "$NGRAM_MODEL_TEMPLATE" "$ORDER")" || {
-        echo "Missing n-gram model file for ${ORDER}-gram."
-        echo "Tried template path: ${NGRAM_MODEL_TEMPLATE//\{order\}/$ORDER}"
-        echo "Train the model with train_ngram_slurm.sh or set NGRAM_MODEL_TEMPLATE accordingly."
-        exit 1
-    }
+    TASK_NAME="$(basename "$QUESTION_FILE" .jsonl)"
 
-    CURRENT_MODEL_ID="${MODEL_ID_PREFIX}_${ORDER}gram"
-    echo "Running ${ORDER}-gram inference"
-    echo "  model path: ${CURRENT_NGRAM_MODEL_PATH}"
-    echo "  model id:   ${CURRENT_MODEL_ID}"
+    for ORDER in $NGRAM_ORDERS; do
+        if ! [[ "$ORDER" =~ ^[0-9]+$ ]] || [[ "$ORDER" -lt 1 ]]; then
+            echo "Invalid n-gram order in NGRAM_ORDERS: $ORDER"
+            echo "Expected a space-separated list of positive integers, e.g. '1 2 3 4'."
+            exit 1
+        fi
 
-    python -m evaluation.inference_ngram \
-        --model-path "$TARGET_MODEL_PATH" \
-        --ngram-model-path "$CURRENT_NGRAM_MODEL_PATH" \
-        --model-id "$CURRENT_MODEL_ID" \
-        --question-file "$QUESTION_FILE" \
-        --bench-name "$BENCH_NAME" \
-        --dtype "$DTYPE" \
-        --draft-num-candidate-tokens "$DRAFT_NUM_CANDIDATE_TOKENS" \
-        --max-new-tokens "$MAX_NEW_TOKENS"
+        CURRENT_NGRAM_MODEL_PATH="$(resolve_ngram_model_path "$NGRAM_MODEL_TEMPLATE" "$ORDER")" || {
+            echo "Missing n-gram model file for ${ORDER}-gram."
+            echo "Tried template path: ${NGRAM_MODEL_TEMPLATE//\{order\}/$ORDER}"
+            echo "Train the model with train_ngram_slurm.sh or set NGRAM_MODEL_TEMPLATE accordingly."
+            exit 1
+        }
+
+        for DRAFT in $DRAFT_CANDIDATES; do
+            if ! [[ "$DRAFT" =~ ^[0-9]+$ ]] || [[ "$DRAFT" -lt 1 ]]; then
+                echo "Invalid draft candidate value: $DRAFT"
+                exit 1
+            fi
+
+            CURRENT_MODEL_ID="${MODEL_ID_PREFIX}_${ORDER}gram_draft${DRAFT}_${TASK_NAME}"
+            echo "Running ${ORDER}-gram inference for task=${TASK_NAME} (draft=${DRAFT})"
+            echo "  model path: ${CURRENT_NGRAM_MODEL_PATH}"
+            echo "  model id:   ${CURRENT_MODEL_ID}"
+            echo "  question file: ${QUESTION_FILE}"
+
+            python -m evaluation.inference_ngram \
+                --model-path "$TARGET_MODEL_PATH" \
+                --ngram-model-path "$CURRENT_NGRAM_MODEL_PATH" \
+                --model-id "$CURRENT_MODEL_ID" \
+                --question-file "$QUESTION_FILE" \
+                --bench-name "$BENCH_NAME" \
+                --dtype "$D_TYPE" \
+                --draft-num-candidate-tokens "$DRAFT" \
+                --max-new-tokens "$MAX_NEW_TOKENS"
+        done
+    done
 done
