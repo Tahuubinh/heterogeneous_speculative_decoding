@@ -1,6 +1,7 @@
 """Generate answers with target LM verification and a standalone token n-gram drafter."""
 
 import argparse
+import re
 
 from fastchat.utils import str_to_torch_dtype
 
@@ -15,6 +16,23 @@ from evaluation.result_utils import (
     write_run_config,
 )
 from model.ngram import TokenNGramModel, greedy_search_ngram
+
+
+def detect_gpu_type() -> str:
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return "cpu"
+
+        device_name = torch.cuda.get_device_name(0).lower()
+        for token in ("a100", "a40", "h100", "l4", "v100", "t4", "4090", "3090", "3080"):
+            if token in device_name:
+                return token
+        cleaned = re.sub(r"[^a-z0-9]+", "_", device_name).strip("._-")
+        return cleaned or "gpu"
+    except Exception:
+        return "gpu"
 
 
 def ngram_forward(
@@ -95,6 +113,12 @@ if __name__ == "__main__":
         default=100,
         help="Fallback token id used when n-gram cannot propose any token.",
     )
+    parser.add_argument(
+        "--gpu-type",
+        type=str,
+        default=None,
+        help="Override the detected GPU type for organizing results (e.g., a40, a100).",
+    )
 
     args = parser.parse_args()
 
@@ -106,6 +130,9 @@ if __name__ == "__main__":
     else:
         question_file = f"data/{args.bench_name}/question.jsonl"
 
+    gpu_type = args.gpu_type or detect_gpu_type()
+    print(f"Detected GPU type: {gpu_type}")
+
     result_bundle = build_result_bundle(
         model_path=args.model_path,
         drafter_path=args.ngram_model_path,
@@ -115,6 +142,7 @@ if __name__ == "__main__":
         version=args.model_id,
         draft_model_label="ngram",
         answer_file_override=args.answer_file,
+        gpu_type=gpu_type,
     )
     answer_file = result_bundle["answer_file"]
 
